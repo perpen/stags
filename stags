@@ -1,0 +1,216 @@
+#!/bin/bash
+set -e
+
+# stags = secure tags
+#
+# A signed file has this structure:
+#   <payload>
+#   === SIGNATURE <authority name 1>
+#   <signature>
+#   === SIGNATURE <authority name 2>
+#   <signature>
+#
+# The payload has to be textual, and end with newline.
+# There can be any number of signatures, or none.
+
+ARGV0=$(basename $0)
+TMP=$(mktemp -d /var/tmp/$ARGV0.XXX)
+trap "{ rm -rf '$TMP'; }" EXIT
+mkdir -p "$TMP"
+
+fatal() {
+    echo -e "$ARGV0: $*" 1>&2
+    exit 1
+}
+
+usage() {
+    cat 1>&2 <<EOS
+Usage:
+  $ARGV0 sign <private keys dir> <file> <authority> [...]
+    Adds authority signature to file.
+  $ARGV0 payload <public keys dir> <file> <authority> [...]
+    Prints the payload iff it is signed by the authorities.
+  $ARGV0 unittest
+    Runs unit tests using some temp authorities.
+EOS
+        exit 2
+}
+
+########################################## testing
+
+create_test_authority() {
+    local authority="$1"
+    echo "Creating test authority $authority"
+    mkdir -p $TMP/authorities
+    pushd $TMP/authorities > /dev/null
+    openssl req -nodes -x509 -sha256 -newkey rsa:4096 \
+        -keyout "$authority.key" \
+        -out "$authority.crt" \
+        -days 365 \
+        -subj "/C=UK/ST=London/L=Woolwich/O=Barbapapa/OU=IT Dept/CN=$authority Sign Key"
+    openssl x509 -in "$authority.crt" -pubkey -out "$authority.pub"
+    popd
+}
+
+# Used from unittest
+assert_cmd_result() {
+    local status="$1"
+    local out="$2"
+    local err="$3"
+    shift 3
+    # cat $4
+    # echo "$*"
+    set +e
+    "$0" "$@" > $TMP/out 2> $TMP/err
+    actual_status=$?
+    set -e
+    expected="status: $status, stdout: '$out', stderr: '$err'"
+    actual="status: $actual_status, stdout: '$(<$TMP/out)', stderr: '$(<$TMP/err)'"
+    [ "$actual" = "$expected" ] || {
+        fatal "Test failed - expected:\n$expected\nbut got:\n$actual"
+    }
+}
+
+unittest() {
+    echo "Running unit tests"
+    local sample=$TMP/my-payload
+    echo hello > $sample
+    
+    create_test_authority a
+    create_test_authority b
+    create_test_authority c
+    
+    echo "Cannot get payload if not signed by required authority"
+    assert_cmd_result 1 "" "$ARGV0: not signed by a" \
+        payload $TMP/authorities $sample a
+    
+    echo "Cannot get payload if pub key not found"
+    assert_cmd_result 1 "" "$ARGV0: public key not found: $TMP/authorities/x.pub" \
+        payload $TMP/authorities $sample x
+    
+    echo "Can sign with 1 authority"
+    assert_cmd_result 0 "" "" \
+        sign $TMP/authorities $sample a
+    
+    echo "Cannot sign if priv key not found"
+    assert_cmd_result 1 "" "$ARGV0: private key not found: /blah/a.key" \
+        sign /blah $sample a
+    
+    echo "Can get payload if signed by single required authority"
+    assert_cmd_result 0 "hello" "" \
+        payload $TMP/authorities $sample a
+    
+    echo "Can sign with 2 more authorities"
+    assert_cmd_result 0 "" "" \
+        sign $TMP/authorities $sample b c
+    
+    echo "Can get payload if signed by multiple required authorities"
+    assert_cmd_result 0 "hello" "" \
+        payload $TMP/authorities $sample a b
+
+    echo "Cannot sign empty file"
+    > $TMP/empty
+    assert_cmd_result 1 "" "$ARGV0: cannot sign an empty file" \
+        sign $TMP/authorities $TMP/empty a
+}
+
+##########################################
+
+# Splits the file into its components, placed into $TMP
+# The directory will contain files `payload`, and for each
+# authority <auth> a file name `<auth>.sig` which contains the
+# base64-encoded signature.
+split_payload() {
+    local signed_payload="$1"
+    local payload=$TMP/payload
+
+    cat $signed_payload | \
+        awk -- "
+        BEGIN {file=\"${payload}\"}
+        /^=== SIGNATURE ([^ ]+) *\$/ {file=\"${TMP}/\"\$3\".sig\"; next; next}
+        /.*/ {print > file}
+        "
+    [[ -s $payload ]] || fatal "cannot sign an empty file"
+}
+
+# Prints the payload on stdout after validation for each of the
+# specified authorities.
+# If validation fails for any authority, nothing is printed on stdout,
+# and we exit 1.
+payload() {
+    local pub_keys_dir="$1"
+    local signed_payload="$2"
+    shift 2
+    local authorities="$@"
+    split_payload $signed_payload
+
+    for authority in $authorities; do
+        local pub=$pub_keys_dir/$authority.pub
+        [[ -r $pub ]] || fatal "public key not found: $pub"
+        local sig=$TMP/$authority.sig
+        [[ -f $sig ]] || fatal "not signed by $authority"
+        local raw=$TMP/$authority
+        base64 -d $sig > $raw
+        openssl dgst -sha256 \
+            -verify $pub_keys_dir/$authority.pub \
+            -signature $raw \
+            $TMP/payload &> /dev/null || \
+            fatal "invalid signature for $authority"
+    done
+
+    cat $TMP/payload
+}
+
+sign() {
+    local priv_keys_dir="$1"
+    local payload="$2"
+    shift 2
+    local authorities="$@"
+
+    split_payload $payload
+
+    # generate new .sig files
+    for authority in $authorities; do
+        local priv=$priv_keys_dir/$authority.key
+        [[ -r $priv ]] || fatal "private key not found: $priv"
+        openssl dgst -sha256 \
+            -sign $priv_keys_dir/$authority.key \
+            -out $TMP/$authority.raw \
+            $TMP/payload
+        base64 < $TMP/$authority.raw > $TMP/$authority.sig
+        rm $TMP/$authority.raw
+    done
+
+    # assemble the new file
+    local new_payload="$TMP/new"
+    cp $TMP/payload $new_payload
+    # Ensure the payload ends with newline
+    [[ $(tail -c1 "$new_payload" | wc -l) > 0 ]] || echo >> $new_payload
+    for signature in $TMP/*.sig; do
+        local authority=$(basename $signature | sed 's/\.sig$//')
+        echo "=== SIGNATURE $authority"
+        cat $signature
+    done >> $new_payload
+    mv $payload $payload.bak
+    mv $new_payload $payload
+}
+
+check_requirements() {
+    which openssl &> /dev/null || fatal "missing openssl command"
+    (openssl version | grep -q ' 1\.') || fatal "openssl version should be 1.*"
+}
+
+##########################################
+
+check_requirements
+
+case $1 in
+sign|payload)
+    [[ $# < 2 ]] && usage
+    [[ ! -r $3 ]] && fatal "file not found: $3"
+    ;;
+unittest) ;;
+*) usage ;;
+esac
+
+eval "$@" 
