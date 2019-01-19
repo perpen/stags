@@ -40,9 +40,10 @@ EOS
 
 create_test_authority() {
     local authority="$1"
-    echo "Creating test authority $authority"
-    mkdir -p $TMP/authorities
-    pushd $TMP/authorities > /dev/null
+    local target_dir="$2"
+    echo "Creating test authority $authority under $target_dir"
+    mkdir -p $target_dir
+    pushd $target_dir > /dev/null
     openssl req -nodes -x509 -sha256 -newkey rsa:4096 \
         -keyout "$authority.key" \
         -out "$authority.crt" \
@@ -74,23 +75,25 @@ assert_cmd_result() {
 unittest() {
     echo "Running unit tests"
     local sample=$TMP/my-payload
+    local keys_dir=$TMP/authorities
     echo hello > $sample
     
-    create_test_authority a
-    create_test_authority b
-    create_test_authority c
+    mkdir -p $keys_dir
+    create_test_authority a $keys_dir
+    create_test_authority b $keys_dir
+    create_test_authority c $keys_dir
     
     echo "Cannot get payload if not signed by required authority"
     assert_cmd_result 1 "" "$ARGV0: not signed by a" \
-        payload $TMP/authorities $sample a
+        payload $keys_dir $sample a
     
     echo "Cannot get payload if pub key not found"
-    assert_cmd_result 1 "" "$ARGV0: public key not found: $TMP/authorities/x.pub" \
-        payload $TMP/authorities $sample x
+    assert_cmd_result 1 "" "$ARGV0: public key not found: $keys_dir/x.pub" \
+        payload $keys_dir $sample x
     
     echo "Can sign with 1 authority"
     assert_cmd_result 0 "" "" \
-        sign $TMP/authorities $sample a
+        sign $keys_dir $sample a
     
     echo "Cannot sign if priv key not found"
     assert_cmd_result 1 "" "$ARGV0: private key not found: /blah/a.key" \
@@ -98,20 +101,20 @@ unittest() {
     
     echo "Can get payload if signed by single required authority"
     assert_cmd_result 0 "hello" "" \
-        payload $TMP/authorities $sample a
+        payload $keys_dir $sample a
     
     echo "Can sign with 2 more authorities"
     assert_cmd_result 0 "" "" \
-        sign $TMP/authorities $sample b c
+        sign $keys_dir $sample b c
     
     echo "Can get payload if signed by multiple required authorities"
     assert_cmd_result 0 "hello" "" \
-        payload $TMP/authorities $sample a b
+        payload $keys_dir $sample a b
 
     echo "Cannot sign empty file"
     > $TMP/empty
     assert_cmd_result 1 "" "$ARGV0: cannot sign an empty file" \
-        sign $TMP/authorities $TMP/empty a
+        sign $keys_dir $TMP/empty a
 }
 
 ##########################################
@@ -144,6 +147,7 @@ payload() {
     local authorities="$@"
     split_payload $signed_payload
 
+    # Check each requested authority
     for authority in $authorities; do
         local pub=$pub_keys_dir/$authority.pub
         [[ -r $pub ]] || fatal "public key not found: $pub"
@@ -158,6 +162,7 @@ payload() {
             fatal "invalid signature for $authority"
     done
 
+    # All was good
     cat $TMP/payload
 }
 
@@ -209,7 +214,7 @@ sign|payload)
     [[ $# < 2 ]] && usage
     [[ ! -r $3 ]] && fatal "file not found: $3"
     ;;
-unittest) ;;
+unittest|create_test_authority) ;;
 *) usage ;;
 esac
 
